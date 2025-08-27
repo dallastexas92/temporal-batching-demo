@@ -56,17 +56,17 @@ temporal-batching-demo/
 
 3. **Run workers (separate terminals):**
    ```bash
-   python batcher-service/worker.py
-   python main-service/worker.py
+   uv run python batcher-service/worker.py
+   uv run python main-service/worker.py
    ```
 
 4. **Start services:**
    ```bash
    # Terminal 3
-   python batcher-service/starter.py
+   uv run python batcher-service/starter.py
    
    # Terminal 4
-   python main-service/starter.py --workflows 10
+   uv run python main-service/starter.py --workflows 10
    ```
 
 5. **View results:**
