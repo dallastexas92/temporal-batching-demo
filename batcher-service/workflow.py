@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
-from batcher_activities import batch_write_to_database
+from activities import batch_write_to_database
 
 
 @workflow.defn  

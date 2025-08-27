@@ -3,7 +3,7 @@ from typing import Dict, Any
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
-from main_activities import simulate_work
+from activities import simulate_work
 
 
 @workflow.defn

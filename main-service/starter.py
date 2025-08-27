@@ -1,7 +1,7 @@
 import asyncio
 import argparse
 from temporalio.client import Client
-from main_workflow import MainWorkflow
+from workflow import MainWorkflow
 
 
 async def start_main_workflows(num_workflows: int):

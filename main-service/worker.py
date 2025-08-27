@@ -2,8 +2,8 @@ import asyncio
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from main_workflow import MainWorkflow
-from main_activities import simulate_work
+from workflow import MainWorkflow
+from activities import simulate_work
 
 
 async def run_main_worker():

@@ -2,8 +2,8 @@ import asyncio
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from batcher_workflow import BatcherWorkflow
-from batcher_activities import batch_write_to_database
+from workflow import BatcherWorkflow
+from activities import batch_write_to_database
 
 
 async def run_batcher_worker():

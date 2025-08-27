@@ -1,6 +1,6 @@
 import asyncio
 from temporalio.client import Client
-from batcher_workflow import BatcherWorkflow
+from workflow import BatcherWorkflow
 
 
 async def start_batcher():
