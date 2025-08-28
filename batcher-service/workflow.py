@@ -14,15 +14,16 @@ class BatcherState:
     """State that gets carried over during continue-as-new with deduplication support"""
     pending_writes: List[Dict[str, Any]]
     processed_batches_count: int
-    total_signals_received: int
-    processed_request_ids: Set[str] = field(default_factory=set)  # NEW: For deduplication
+    # Note: total_signals_received removed - we'll use a session counter instead
+    processed_request_ids: Set[str] = field(default_factory=set)  # Only for pending requests
+    continue_as_new_count: int = 0  # Safety counter to prevent infinite loops
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "pending_writes": self.pending_writes,
-            "processed_batches_count": self.processed_batches_count, 
-            "total_signals_received": self.total_signals_received,
-            "processed_request_ids": list(self.processed_request_ids)  # Convert set to list for JSON
+            "processed_batches_count": self.processed_batches_count,
+            "processed_request_ids": list(self.processed_request_ids),  # Convert set to list for JSON
+            "continue_as_new_count": self.continue_as_new_count
         }
     
     @classmethod
@@ -30,54 +31,60 @@ class BatcherState:
         return cls(
             pending_writes=data.get("pending_writes", []),
             processed_batches_count=data.get("processed_batches_count", 0),
-            total_signals_received=data.get("total_signals_received", 0),
-            processed_request_ids=set(data.get("processed_request_ids", []))  # Convert list back to set
+            processed_request_ids=set(data.get("processed_request_ids", [])),  # Convert list back to set
+            continue_as_new_count=data.get("continue_as_new_count", 0)
         )
 
 
 @workflow.defn  
 class BatcherWorkflow:
     """
-    Batcher workflow with exactly-once message processing and continue-as-new support
+    Batcher workflow with exactly-once message processing and improved continue-as-new support
     """
     
     def __init__(self):
         self.state = BatcherState(
             pending_writes=[],
             processed_batches_count=0,
-            total_signals_received=0,
-            processed_request_ids=set()
+            processed_request_ids=set(),
+            continue_as_new_count=0
         )
         self.batch_size_limit = 100
-        self.continue_as_new_threshold = 1000  # Continue-as-new after receiving 1k signals (only counts signals received)
+        # Session-level counter (resets on each continue-as-new)
+        self.session_signals_received = 0
         self.max_batch_wait_time = timedelta(seconds=20)
-        # Cleanup processed IDs periodically to prevent unbounded growth
-        self.max_processed_ids_to_keep = 10000
+        # Safety limits
+        self.max_continue_as_new_cycles = 10  # Prevent runaway continue-as-new
         
     @workflow.run
     async def run(self, initial_state: Optional[Dict[str, Any]] = None) -> None:
-        """Main workflow run method with continue-as-new support"""
+        """Main workflow run method with improved continue-as-new support"""
         
         # Restore state if continuing from previous execution
         if initial_state:
             self.state = BatcherState.from_dict(initial_state)
             workflow.logger.info(f"Resumed batcher with {len(self.state.pending_writes)} pending writes, "
                                f"{self.state.processed_batches_count} batches processed, "
-                               f"{self.state.total_signals_received} total signals, "
-                               f"{len(self.state.processed_request_ids)} processed request IDs")
+                               f"{len(self.state.processed_request_ids)} tracked request IDs, "
+                               f"continue-as-new cycle {self.state.continue_as_new_count}")
+            
+            # Safety check: Prevent infinite continue-as-new loops
+            if self.state.continue_as_new_count >= self.max_continue_as_new_cycles:
+                workflow.logger.error(f"Maximum continue-as-new cycles ({self.max_continue_as_new_cycles}) reached. "
+                                    "Forcing batch processing and resetting counter.")
+                # Force process all pending writes to break the cycle
+                if self.state.pending_writes:
+                    await self._process_batch()
+                # Reset counter to allow normal operation
+                self.state.continue_as_new_count = 0
         else:
             workflow.logger.info("Batcher workflow started fresh")
         
         while True:
-            # Check if we should continue-as-new to prevent unbounded history growth
-            if self.state.total_signals_received >= self.continue_as_new_threshold:
-                workflow.logger.info(f"Continuing as new after {self.state.total_signals_received} signals")
-                
-                # Cleanup old processed request IDs to prevent unbounded growth
-                self._cleanup_old_request_ids()
-                
-                workflow.continue_as_new(self.state.to_dict())
-                return
+            # Check if we should continue-as-new
+            if self._should_continue_as_new():
+                await self._safe_continue_as_new()
+                return  # This execution ends here
             
             # Wait for batch conditions
             try:
@@ -92,26 +99,61 @@ class BatcherWorkflow:
             if self.state.pending_writes:
                 await self._process_batch()
     
-    def _cleanup_old_request_ids(self):
-        """
-        Cleanup old processed request IDs to prevent unbounded memory growth.
-        Keep only the most recent IDs based on a reasonable retention policy.
-        """
-        if len(self.state.processed_request_ids) > self.max_processed_ids_to_keep:
-            # In a real implementation, you might want to keep IDs from the last N minutes/hours
-            # For now, we'll keep a fixed number of the most recent ones
-            # Note: Sets don't maintain order, so this is a simple cleanup
-            ids_to_remove = len(self.state.processed_request_ids) - (self.max_processed_ids_to_keep // 2)
-            ids_list = list(self.state.processed_request_ids)
-            self.state.processed_request_ids = set(ids_list[ids_to_remove:])
+    def _should_continue_as_new(self) -> bool:
+        """Determine if workflow should continue-as-new using recommended patterns"""
+        
+        # Primary: Use Temporal's built-in suggestion (recommended approach)
+        if workflow.info().is_continue_as_new_suggested():
+            workflow.logger.info("Continue-as-new suggested by Temporal")
+            return True
+        
+        # Safety: Large pending queue (prevent unbounded state growth)
+        if len(self.state.pending_writes) > self.batch_size_limit * 10:  # 1000 pending writes
+            workflow.logger.warn(f"Continue-as-new triggered by large pending queue: {len(self.state.pending_writes)}")
+            return True
             
-            workflow.logger.info(f"Cleaned up {ids_to_remove} old processed request IDs")
+        return False
+    
+    async def _safe_continue_as_new(self):
+        """Safely continue-as-new with proper cleanup and state management"""
+        
+        workflow.logger.info("Preparing for continue-as-new...")
+        
+        # Step 1: Wait for any running signal handlers to complete
+        try:
+            await workflow.wait_condition(
+                lambda: workflow.all_handlers_finished(),
+                timeout=timedelta(seconds=10)
+            )
+            workflow.logger.debug("All signal handlers finished")
+        except asyncio.TimeoutError:
+            workflow.logger.warn("Timeout waiting for signal handlers - continuing anyway")
+        
+        # Step 2: Process any pending batch to reduce state size
+        if self.state.pending_writes:
+            workflow.logger.info(f"Processing {len(self.state.pending_writes)} pending writes before continue-as-new")
+            await self._process_batch()
+        
+        # Step 3: Clean up deduplication state
+        # Only keep request IDs for truly pending requests (should be empty after processing)
+        pending_request_ids = {req['request_id'] for req in self.state.pending_writes if 'request_id' in req}
+        old_count = len(self.state.processed_request_ids)
+        self.state.processed_request_ids = pending_request_ids
+        workflow.logger.info(f"Cleaned up deduplication state: {old_count} -> {len(self.state.processed_request_ids)} request IDs")
+        
+        # Step 4: Prepare state for next execution
+        self.state.continue_as_new_count += 1
+        continue_state = self.state.to_dict()
+        
+        workflow.logger.info(f"Continuing as new (cycle {self.state.continue_as_new_count})")
+        workflow.continue_as_new(continue_state)
     
     async def _process_batch(self):
-        """Process the current batch with improved error handling"""
+        """Process the current batch with improved deduplication cleanup"""
         
         # Create a snapshot of the current batch
         batch_to_process = self.state.pending_writes.copy()
+        batch_request_ids = {req['request_id'] for req in batch_to_process if 'request_id' in req}
         self.state.pending_writes.clear()
         
         batch_id = f"batch-{self.state.processed_batches_count + 1}"
@@ -131,8 +173,12 @@ class BatcherWorkflow:
                 )
             )
             
-            # Update state after successful processing
+            # SUCCESS: Update state and clean up deduplication
             self.state.processed_batches_count += 1
+            
+            # CRITICAL: Remove successfully processed request IDs from deduplication set
+            self.state.processed_request_ids -= batch_request_ids
+            workflow.logger.debug(f"Removed {len(batch_request_ids)} request IDs from deduplication set")
             
             # Enhanced result with batch metadata
             enhanced_result = {
@@ -155,9 +201,11 @@ class BatcherWorkflow:
         except Exception as e:
             workflow.logger.error(f"Failed to process {batch_id}: {e}")
             
-            # Re-add failed writes to pending (with some risk of reordering)
+            # FAILURE: Re-add failed writes to pending (keep request IDs in deduplication set)
             workflow.logger.warn(f"Re-queuing {len(batch_to_process)} failed writes")
             self.state.pending_writes.extend(batch_to_process)
+            # Note: We don't remove request_ids from processed_request_ids on failure
+            # This ensures we won't accept duplicates during retry
     
     async def _send_confirmation_safe(self, write_request: Dict[str, Any], result: Dict[str, Any]):
         """Safely send confirmation to requesting workflow with error handling"""
@@ -167,6 +215,8 @@ class BatcherWorkflow:
             workflow.logger.warn("Write request missing requesting_workflow field")
             return
         
+        # TODO: Implement retry logic for confirmation delivery to prevent workflow timeouts
+        # when batch write to DB succeeds but confirmation signal fails
         try:
             requesting_handle = workflow.get_external_workflow_handle(requesting_workflow_id)
             await requesting_handle.signal("write_confirmation", result)
@@ -196,7 +246,6 @@ class BatcherWorkflow:
         request_id = request.get("request_id")
         if not request_id:
             # Generate a deterministic request ID if not provided (for backward compatibility)
-            # Use deterministic hash instead of random UUID
             request_data = f"{request['workflow_id']}-{request.get('data', '')}-{workflow.now().isoformat()}"
             request_id = f"{request['workflow_id']}-{hashlib.md5(request_data.encode()).hexdigest()[:8]}"
             request["request_id"] = request_id
@@ -207,24 +256,24 @@ class BatcherWorkflow:
             workflow.logger.info(f"Duplicate request {request_id} from {request['workflow_id']} - ignoring")
             return
         
-        # Mark request as processed BEFORE adding to queue (exactly-once guarantee)
+        # Mark request as being processed (add to deduplication set)
         self.state.processed_request_ids.add(request_id)
         
         # Add request with metadata
         enriched_request = {
             **request,
             "received_at": workflow.now(),
-            "batch_sequence": self.state.total_signals_received,
-            "request_id": request_id  # Ensure request_id is in the enriched request
+            "batch_sequence": self.session_signals_received,  # Session-level sequence
+            "request_id": request_id
         }
         
         self.state.pending_writes.append(enriched_request)
-        self.state.total_signals_received += 1
+        self.session_signals_received += 1  # Increment session counter (resets on continue-as-new)
         
         workflow.logger.info(
             f"Added write request {request_id} from {request['workflow_id']} "
-            f"(total pending: {len(self.state.pending_writes)}, "
-            f"total received: {self.state.total_signals_received})"
+            f"(pending: {len(self.state.pending_writes)}, "
+            f"session signals: {self.session_signals_received})"
         )
     
     @workflow.query
@@ -233,10 +282,11 @@ class BatcherWorkflow:
         return {
             "pending_writes": len(self.state.pending_writes),
             "processed_batches": self.state.processed_batches_count,
-            "total_signals_received": self.state.total_signals_received,
+            "session_signals_received": self.session_signals_received,  # Session counter
             "processed_request_ids_count": len(self.state.processed_request_ids),
-            "continue_as_new_threshold": self.continue_as_new_threshold,
-            "batch_size_limit": self.batch_size_limit
+            "continue_as_new_cycle": self.state.continue_as_new_count,
+            "batch_size_limit": self.batch_size_limit,
+            "is_continue_suggested": workflow.info().is_continue_as_new_suggested()
         }
     
     @workflow.query  

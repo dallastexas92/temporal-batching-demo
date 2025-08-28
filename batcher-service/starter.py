@@ -49,7 +49,7 @@ class BatcherManager:
         """Monitor batcher health and display statistics"""
         
         print("\n🔄 Starting batcher health monitoring...")
-        print("=" * 60)
+        print("=" * 70)
         
         while True:
             try:
@@ -60,9 +60,11 @@ class BatcherManager:
                 print(f"[{current_time}] Batcher Stats:")
                 print(f"  📝 Pending writes: {stats['pending_writes']}")
                 print(f"  ✅ Processed batches: {stats['processed_batches']}")
-                print(f"  📨 Total signals: {stats['total_signals_received']}")
-                print(f"  🔄 Continue-as-new threshold: {stats['continue_as_new_threshold']}")
-                print("-" * 40)
+                print(f"  📨 Session signals: {stats['session_signals_received']}")
+                print(f"  🆔 Tracked request IDs: {stats['processed_request_ids_count']}")
+                print(f"  🔄 Continue-as-new cycle: {stats['continue_as_new_cycle']}")
+                print(f"  💡 Temporal suggests continue: {stats['is_continue_suggested']}")
+                print("-" * 50)
                 
                 # Check if batcher is still running
                 description = await batcher_handle.describe()
@@ -90,18 +92,25 @@ class BatcherManager:
     async def run(self):
         """Main run method"""
         
-        print("🎯 Starting Batcher Management System")
-        print("=" * 50)
+        print("🎯 Starting Batcher Management System (v2.0)")
+        print("=" * 60)
+        print("🔧 Improvements:")
+        print("  • Fixed infinite continue-as-new loops")
+        print("  • Session-based signal counting")
+        print("  • Proper deduplication cleanup")
+        print("  • Uses Temporal's continue-as-new suggestions")
+        print("  • Safety mechanisms for runaway cycles")
+        print("=" * 60)
         
         batcher_handle = await self.start_or_resume_batcher()
         if not batcher_handle:
             print("❌ Failed to start or connect to batcher")
             return
         
-        print("=" * 50)
+        print("=" * 60)
         print("🌐 View in Temporal Web UI: http://localhost:8233")
         print("💡 Press Ctrl+C to stop monitoring")
-        print("=" * 50)
+        print("=" * 60)
         
         try:
             await self.monitor_batcher_health(batcher_handle)

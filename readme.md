@@ -11,7 +11,7 @@
 - **Acknowledgment**: Each workflow receives confirmation when write completes
 - **Load Reduction**: N individual DB calls → 1 batch operation
 - **Exactly-Once Processing**: Request deduplication prevents duplicate writes
-- **Continue-as-New**: Automatic workflow restart to prevent unbounded event history growth
+- **Robust Continue-as-New**: Proper workflow restart to prevent unbounded event history growth
 
 ## Architecture
 
@@ -38,10 +38,10 @@ temporal-batching-demo/
 │   └── starter.py          # Start main workflows
 │
 └── batcher-service/
-    ├── workflow.py          # Batcher workflow with continue-as-new
+    ├── workflow.py          # Batcher workflow with proper continue-as-new
     ├── activities.py        # Batch write activities
     ├── worker.py           # Batcher worker
-    └── starter.py          # Start batcher service with health monitoring
+    └── starter.py          # Start batcher service with enhanced monitoring
 ```
 
 ## Quick Start
@@ -83,7 +83,7 @@ temporal-batching-demo/
 4. Single batch write operation executes (printed to console)
 5. Batcher confirms completion to all workflows
 6. Main workflows complete successfully, or fail if write not confirmed within 2 minutes
-7. Batcher continues-as-new every 1000 signals to prevent event history growth
+7. Batcher uses Temporal's recommendations for continue-as-new timing to maintain optimal performance
 
 ## Key Features
 
@@ -95,12 +95,13 @@ temporal-batching-demo/
 ### **Exactly-Once Processing**
 - Request deduplication using deterministic request IDs
 - Duplicate signals are safely ignored
-- Deduplication state survives continue-as-new
+- Request IDs removed after successful processing
 
-### **Continue-as-New**
-- Batcher restarts every 1000 signals to prevent unbounded event history
-- State (pending writes, counters, processed request IDs) preserved across restarts
-- Health monitoring detects and handles continue-as-new transitions
+### **Robust Continue-as-New**
+- Uses Temporal's `workflow.info().is_continue_as_new_suggested()` for optimal timing
+- State cleanup and signal handler synchronization before continuing
+- Bounded memory usage with smart deduplication cleanup
+- Safety mechanisms prevent infinite continue-as-new loops
 
 ### **Error Handling**
 - Comprehensive retry logic for signal delivery failures
@@ -111,26 +112,25 @@ temporal-batching-demo/
 The starter script provides real-time monitoring:
 - Pending write requests
 - Processed batch count
-- Total signals received
-- Continue-as-new events
-- Payload size estimation
+- Session-level signal counts
+- Active deduplication set size
+- Continue-as-new cycle counter
+- Temporal's continue-as-new suggestions
+- Continue-as-new event detection and handle updates
 
 ## Production Considerations
 
-### **Current Limitations**
-- **Continue-as-New Payload Size**: High signal volumes can create large state payloads during continue-as-new
-- **Single Batcher**: One batcher workflow processes all requests
-- **Memory-Based Deduplication**: Processed request IDs stored in workflow memory
-- **Unbounded State Growth**: Without proper cleanup, processed request IDs and pending writes can grow indefinitely, causing continue-as-new failures when payloads exceed Temporal's limits
-
-### **Scaling Solutions**
+### **Scaling Solutions for Higher Volumes**
 - **Shard Batchers**: Multiple batcher workflows with deterministic routing
 
-## Recommended Thresholds
+### **Known Limitations**
+- **Single Batcher**: One batcher workflow processes all requests
+- **Hardcoded Configuration**: Batcher workflow ID and parameters are hardcoded
+- **Confirmation Delivery**: No retry logic for confirmation signals back to caller workflows (TODO: add retry for production)
+
+## Recommended Configuration
 - **Batch Size**: 100 requests (configurable)
 - **Batch Timeout**: 20 seconds (configurable)
-- **Continue-as-New**: 1000 signals (prevents large payloads)
 - **Write Confirmation Timeout**: 2 minutes (ensures transactional integrity)
-- **Deduplication Window**: Last 500 processed request IDs
-
-Perfect for medium-scale use cases (thousands of requests per minute). For higher volumes, implement sharding or external deduplication storage.
+- **Continue-as-New**: Driven by Temporal's built-in suggestions
+- **Continue-as-New Safety Limit**: 10 cycles (prevents runaway loops)
